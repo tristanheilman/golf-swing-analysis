@@ -74,6 +74,13 @@ _(Output video will be saved in `output/` as MP4.)_
 ```bash
 git clone https://github.com/HeleenaRobert/golf-swing-analysis.git
 cd golf-swing-analysis
+
+# Windows
+pip install -r requirements.txt
+
+# Mac
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
