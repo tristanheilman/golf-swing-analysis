@@ -277,22 +277,38 @@ def export_swing_data(output_path, video_path, fps, phases, frame_data):
 
         if impact_frame is not None and impact_frame in frame_lookup:
             fd = frame_lookup[impact_frame]
-            wrist_speed = None
-            prev_frame = frame_lookup.get(impact_frame - 1)
-            if prev_frame:
-                dx = fd.get("wrist_x", 0) - prev_frame.get("wrist_x", 0)
-                dy = fd.get("wrist_y", 0) - prev_frame.get("wrist_y", 0)
-                wrist_speed = round(math.sqrt(dx**2 + dy**2), 2)
+            # Average wrist speed over a ±3 frame window around impact to reduce noise
+            speed_window = 3
+            speeds = []
+            for i in range(impact_frame - speed_window, impact_frame + speed_window + 1):
+                curr = frame_lookup.get(i)
+                prev = frame_lookup.get(i - 1)
+                if curr and prev:
+                    dx = curr["wrist_x"] - prev["wrist_x"]
+                    dy = curr["wrist_y"] - prev["wrist_y"]
+                    speeds.append(math.sqrt(dx**2 + dy**2))
+            wrist_speed = round(max(speeds), 2) if speeds else None
             metrics_at_impact = {
                 "hip_rotation_deg": fd.get("hip_rotation_deg"),
                 "wrist_speed_px_per_frame": wrist_speed,
             }
+
+    # Tempo ratio: backswing frames / downswing frames (pro average ~3:1)
+    tempo_ratio = None
+    if phases:
+        bs = phases.get("backswing", {})
+        ds = phases.get("downswing", {})
+        bs_frames = bs.get("end_frame", 0) - bs.get("start_frame", 0)
+        ds_frames = ds.get("end_frame", 0) - ds.get("start_frame", 0)
+        if ds_frames > 0:
+            tempo_ratio = round(bs_frames / ds_frames, 2)
 
     swing_data = {
         "video": video_path,
         "fps": fps,
         "total_frames": len(frame_data),
         "phases": phases,
+        "tempo_ratio": tempo_ratio,
         "metrics_at_top": metrics_at_top,
         "metrics_at_impact": metrics_at_impact,
         "frame_data": frame_data,
