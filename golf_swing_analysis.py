@@ -1,7 +1,9 @@
 import cv2
 import os
+import math
+from collections import deque
 from utils.video_utils import create_video_capture, create_video_writer
-from utils.swing_utils import process_frame, detect_ball, detect_swing_phases, export_swing_data
+from utils.swing_utils import process_frame, detect_ball, detect_swing_phases, export_swing_data, stamp_phase_labels
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 
@@ -49,16 +51,33 @@ def process_video(input_video):
 
     frame_data = []
     frame_num = 0
+    wrist_trail = deque(maxlen=20)  # last 20 wrist positions for path trail
+    prev_wrist = None               # wrist position from the previous frame
+    wrist_speed_display = None      # speed computed from prev frame (shown on current frame)
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        annotated_frame, metrics = process_frame(frame, frame_size, ball_pos=ball_pos)
+        annotated_frame, metrics = process_frame(
+            frame, frame_size,
+            ball_pos=ball_pos,
+            wrist_speed=wrist_speed_display,
+            wrist_trail=list(wrist_trail),
+            frame_num=frame_num,
+            fps=fps,
+        )
         writer.write(annotated_frame)
 
         if metrics:
+            curr_wrist = (metrics["wrist_x"], metrics["wrist_y"])
+            if prev_wrist:
+                dx = curr_wrist[0] - prev_wrist[0]
+                dy = curr_wrist[1] - prev_wrist[1]
+                wrist_speed_display = round(math.sqrt(dx**2 + dy**2), 1)
+            wrist_trail.append(curr_wrist)
+            prev_wrist = curr_wrist
             frame_data.append({"frame": frame_num, **metrics})
 
         frame_num += 1
@@ -83,6 +102,9 @@ def process_video(input_video):
         print("  Could not detect swing phases (too few frames with pose data).")
 
     export_swing_data(output_json_path, input_video, fps, phases, frame_data)
+
+    # Second pass: stamp current swing phase label onto each frame
+    stamp_phase_labels(output_video_path, phases, fps)
     print(f"  Annotated video: {output_video_path}\n")
 
 

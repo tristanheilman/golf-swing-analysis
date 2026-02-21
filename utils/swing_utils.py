@@ -99,11 +99,15 @@ def detect_ball(frame, frame_size):
     return (x, y)
 
 
-def process_frame(frame, frame_size, ball_pos=None):
+def process_frame(frame, frame_size, ball_pos=None, wrist_speed=None, wrist_trail=None, frame_num=0, fps=30):
     """Process a single frame. Returns (annotated_frame, metrics_dict).
 
     Args:
-        ball_pos: (x, y) pixel position of the golf ball, or None to skip ball annotation.
+        ball_pos:     (x, y) pixel position of the golf ball, or None to skip ball annotation.
+        wrist_speed:  Wrist speed in px/frame from the previous frame (for HUD display).
+        wrist_trail:  List of recent (x, y) wrist positions to draw as a fading path.
+        frame_num:    Current frame index (for HUD timestamp).
+        fps:          Video frame rate (for HUD timestamp).
     """
     frame_w, frame_h = frame_size
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -114,6 +118,18 @@ def process_frame(frame, frame_size, ball_pos=None):
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
     _draw_axes(frame_bgr, origin=(100, frame_h - 100))
+
+    # Draw wrist trail behind everything else
+    if wrist_trail:
+        n = len(wrist_trail)
+        for i, pos in enumerate(wrist_trail):
+            t = i / n  # 0 = oldest, 1 = newest
+            brightness = int(60 + t * 195)
+            radius = max(2, int(2 + t * 4))
+            cv2.circle(frame_bgr, pos, radius, (0, brightness, brightness), -1)
+
+    # HUD: frame counter, elapsed time, wrist speed
+    _draw_hud(frame_bgr, frame_num, fps, wrist_speed)
 
     metrics = {}
 
@@ -210,32 +226,69 @@ def detect_swing_phases(wrist_x_list, wrist_y_list, frame_numbers=None):
     x = np.array(wrist_x_list, dtype=float)
     y = np.array(wrist_y_list, dtype=float)
 
-    # Smooth to reduce per-frame noise
-    window = max(3, n // 20)
+    # Aggressive smoothing to suppress setup micro-movements and per-frame jitter.
+    # Use at least 7 frames, up to 1/8 of the clip length.
+    window = max(7, n // 8)
     kernel = np.ones(window) / window
     x_smooth = np.convolve(x, kernel, mode='same')
     y_smooth = np.convolve(y, kernel, mode='same')
 
+    # Guard margin: convolution edge artifacts — skip the outermost window//2 frames
+    # when searching for peaks, then clamp results into valid range.
+    margin = window // 2
+
+    # --- Impact: wrist at maximum y (lowest in image), search after first quarter ---
+    # Restricting the search range prevents picking up a low setup position as impact.
+    impact_search_start = max(margin, n // 4)
+    impact_idx = impact_search_start + int(np.argmax(y_smooth[impact_search_start:n - margin]))
+
+    # --- Top of backswing: maximum x-displacement from the starting position ---
+    # This replaces the noisy zero-crossing approach. The wrist travels furthest from
+    # its address x-position at the top, regardless of which direction it swings.
+    x_ref = x_smooth[margin]  # use a smoothed reference near the start, not raw frame 0
+    x_displacement = np.abs(x_smooth[margin:impact_idx] - x_ref)
+    if len(x_displacement) > 0:
+        top_idx = margin + int(np.argmax(x_displacement))
+    else:
+        top_idx = impact_idx // 2
+    # Enforce a minimum backswing length (at least 10% of frames)
+    top_idx = max(top_idx, margin + max(1, n // 10))
+    top_idx = min(top_idx, impact_idx - 1)
+
+    # --- Address end: first sustained burst of movement toward the top ---
+    # Require CONSECUTIVE frames above threshold to ignore single-frame fidgets.
     dx = np.diff(x_smooth)
-
-    # Impact: wrist at maximum y (lowest point in image coords)
-    impact_idx = int(np.argmax(y_smooth))
-
-    # Top of backswing: last x-direction reversal before impact
-    # np.diff(np.sign(dx))[i] != 0  → sign changed between dx[i] and dx[i+1]
-    # which corresponds to the reversal happening around list index i+1
-    sign_changes = np.where(np.diff(np.sign(dx)))[0] + 1
-    top_candidates = sign_changes[sign_changes < impact_idx]
-    top_idx = int(top_candidates[-1]) if len(top_candidates) > 0 else impact_idx // 2
-
-    # Address: low-velocity region at the start before backswing begins
-    speed = np.abs(dx)
+    dy = np.diff(y_smooth)
+    speed = np.sqrt(dx**2 + dy**2)
     pre_top_speed = speed[:top_idx] if top_idx > 0 else speed
-    speed_threshold = np.percentile(pre_top_speed, 40) * 2
+    speed_threshold = np.percentile(pre_top_speed, 60) * 1.5
+    consecutive_needed = 3  # must stay above threshold for 3 frames to count
     address_end_idx = 0
+    consecutive = 0
     for i in range(top_idx):
         if speed[i] > speed_threshold:
-            address_end_idx = max(0, i - 1)
+            consecutive += 1
+            if consecutive >= consecutive_needed:
+                address_end_idx = max(0, i - consecutive_needed)
+                break
+        else:
+            consecutive = 0
+
+    # --- Downswing start: when wrist x crosses back through the address plane ---
+    # "The plane" = the wrist's x-position at address (x_ref).
+    # Downswing (and follow-through) cannot be declared until the wrist has
+    # physically returned to that x-position on the way back to impact.
+    # backswing_dir tells us which side of x_ref the wrist traveled to at the top,
+    # so we can detect the crossing regardless of camera orientation or handedness.
+    backswing_dir = np.sign(x_smooth[top_idx] - x_ref)  # +1 = right, -1 = left
+    downswing_start_idx = min(top_idx + 1, impact_idx - 1)  # safe fallback
+
+    for i in range(top_idx, min(impact_idx + 1, n)):
+        # Displaced is positive while on the backswing side of the plane,
+        # zero or negative once the wrist has crossed back through.
+        displaced = (x_smooth[i] - x_ref) * backswing_dir
+        if displaced <= 0:
+            downswing_start_idx = i
             break
 
     def fn(idx):
@@ -244,12 +297,12 @@ def detect_swing_phases(wrist_x_list, wrist_y_list, frame_numbers=None):
         return frame_numbers[idx]
 
     phases = {
-        "address":        {"start_frame": fn(0),                  "end_frame": fn(address_end_idx)},
-        "backswing":      {"start_frame": fn(address_end_idx + 1), "end_frame": fn(top_idx - 1)},
+        "address":        {"start_frame": fn(0),                    "end_frame": fn(address_end_idx)},
+        "backswing":      {"start_frame": fn(address_end_idx + 1),   "end_frame": fn(top_idx - 1)},
         "top":            {"frame": fn(top_idx)},
-        "downswing":      {"start_frame": fn(top_idx + 1),         "end_frame": fn(max(top_idx + 1, impact_idx - 1))},
+        "downswing":      {"start_frame": fn(downswing_start_idx),   "end_frame": fn(max(downswing_start_idx, impact_idx - 1))},
         "impact":         {"frame": fn(impact_idx)},
-        "follow_through": {"start_frame": fn(impact_idx + 1),      "end_frame": fn(n - 1)},
+        "follow_through": {"start_frame": fn(impact_idx + 1),        "end_frame": fn(n - 1)},
     }
 
     return phases
@@ -318,6 +371,82 @@ def export_swing_data(output_path, video_path, fps, phases, frame_data):
         json.dump(swing_data, f, indent=2)
 
     print(f"Swing data exported to: {output_path}")
+
+
+def stamp_phase_labels(video_path, phases, fps):
+    """
+    Post-processing pass: read the already-written annotated video and stamp
+    the current swing phase label on each frame, then replace the original file.
+    """
+    if not phases:
+        return
+
+    # BGR colors per phase
+    PHASE_COLORS = {
+        "ADDRESS":        (200, 200, 200),
+        "BACKSWING":      (  0, 200, 255),
+        "TOP":            (255, 255,   0),
+        "DOWNSWING":      (  0, 140, 255),
+        "IMPACT":         (  0,   0, 255),
+        "FOLLOW_THROUGH": (  0, 200,   0),
+    }
+
+    def phase_for_frame(n):
+        return ""
+
+    cap = cv2.VideoCapture(video_path)
+    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps_in = cap.get(cv2.CAP_PROP_FPS)
+
+    tmp_path = video_path + ".tmp.mp4"
+    writer = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*'mp4v'), fps_in, (w, h))
+
+    frame_num = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        label = phase_for_frame(frame_num)
+        if label:
+            color = PHASE_COLORS.get(label, (255, 255, 255))
+            font = cv2.FONT_HERSHEY_DUPLEX
+            scale = 1.2
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+            tx = (w - tw) // 2
+            ty = 58
+            # Drop shadow for readability over any background
+            cv2.putText(frame, label, (tx + 2, ty + 2), font, scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+            cv2.putText(frame, label, (tx, ty),         font, scale, color,     thickness,     cv2.LINE_AA)
+
+        writer.write(frame)
+        frame_num += 1
+
+    cap.release()
+    writer.release()
+    os.replace(tmp_path, video_path)
+    print(f"  Phase labels stamped onto: {video_path}")
+
+
+def _draw_hud(frame, frame_num, fps, wrist_speed):
+    """Semi-transparent HUD panel in the top-left corner."""
+    speed_str = f"{wrist_speed:.1f} px/f" if wrist_speed is not None else "--"
+    lines = [
+        f"Frame {frame_num}  |  {frame_num / max(fps, 1):.1f}s",
+        f"Wrist Spd: {speed_str}",
+    ]
+    pad, line_h, box_w = 8, 22, 210
+    box_h = pad * 2 + len(lines) * line_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10, 10), (10 + box_w, 10 + box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    for i, line in enumerate(lines):
+        y = 10 + pad + (i + 1) * line_h
+        cv2.putText(frame, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
 
 
 def _get_point(landmark, frame_w, frame_h):
