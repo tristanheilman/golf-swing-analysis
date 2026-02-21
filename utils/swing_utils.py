@@ -5,17 +5,28 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import math
 import os
+import json
 import urllib.request
 
-# Fixed golf ball position
-BALL_POS = (650, 927)
 COLORS = {
     "light": (255, 255, 0),
     "marks": (0, 255, 255),
     "join": (0, 20, 200),
     "axis": (200, 200, 200),
-    "text": (0, 255, 0)
+    "text": (0, 255, 0),
+    "text2": (0, 200, 255),
 }
+
+# MediaPipe Pose landmark indices
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+LEFT_HIP = 23
+RIGHT_HIP = 24
+LEFT_WRIST = 15
+RIGHT_WRIST = 16
+LEFT_KNEE = 25
+RIGHT_KNEE = 26
+RIGHT_EAR = 8
 
 # Create PoseLandmarker once at module level
 _pose_detector = None
@@ -47,68 +58,274 @@ def _get_pose_detector():
         _pose_detector = vision.PoseLandmarker.create_from_options(options)
     return _pose_detector
 
-def process_frame(frame, frame_size):
+def detect_ball(frame, frame_size):
+    """
+    Attempt to detect a golf ball in the frame using Hough circle detection.
+    Color-agnostic — detects by shape (small circle) in the lower portion of the frame.
+
+    Returns (x, y) pixel tuple if found, or None if no confident detection.
+    """
+    frame_w, frame_h = frame_size
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    # Only search the lower 60% of the frame — ball is on the ground
+    search_top = int(frame_h * 0.4)
+    roi = blurred[search_top:, :]
+
+    # Golf balls are small: expect radius roughly 0.5–2% of frame width
+    min_radius = max(5,  int(frame_w * 0.005))
+    max_radius = max(20, int(frame_w * 0.02))
+
+    circles = cv2.HoughCircles(
+        roi,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=min_radius * 4,
+        param1=60,
+        param2=30,
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+
+    if circles is None:
+        return None
+
+    circles = np.round(circles[0]).astype(int)
+
+    # Pick the circle with the highest Y value (lowest in frame = on the ground)
+    best = max(circles, key=lambda c: c[1])
+    x, y = best[0], best[1] + search_top  # offset back to full-frame coords
+    return (x, y)
+
+
+def process_frame(frame, frame_size, ball_pos=None):
+    """Process a single frame. Returns (annotated_frame, metrics_dict).
+
+    Args:
+        ball_pos: (x, y) pixel position of the golf ball, or None to skip ball annotation.
+    """
     frame_w, frame_h = frame_size
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # Get the detector
     detector = _get_pose_detector()
-
-    # Convert frame to MediaPipe Image
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-
-    # Detect pose
     detection_result = detector.detect(mp_image)
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-    # Draw X/Y axis in bottom-left corner
     _draw_axes(frame_bgr, origin=(100, frame_h - 100))
+
+    metrics = {}
 
     if detection_result.pose_landmarks:
         landmarks = detection_result.pose_landmarks[0]
 
-        # Extract points using landmark indices
-        r_ear = _get_point_from_landmark(landmarks[8], frame_w, frame_h)  # RIGHT_EAR
-        r_wrist = _get_point_from_landmark(landmarks[16], frame_w, frame_h)  # RIGHT_WRIST
-        r_hip = _get_point_from_landmark(landmarks[24], frame_w, frame_h)  # RIGHT_HIP
+        # Extract key points
+        r_ear      = _get_point(landmarks[RIGHT_EAR], frame_w, frame_h)
+        r_wrist    = _get_point(landmarks[RIGHT_WRIST], frame_w, frame_h)
+        r_hip      = _get_point(landmarks[RIGHT_HIP], frame_w, frame_h)
+        l_hip      = _get_point(landmarks[LEFT_HIP], frame_w, frame_h)
+        l_shoulder = _get_point(landmarks[LEFT_SHOULDER], frame_w, frame_h)
+        r_shoulder = _get_point(landmarks[RIGHT_SHOULDER], frame_w, frame_h)
 
-        # Draw lines
+        mid_hip      = ((l_hip[0] + r_hip[0]) // 2,      (l_hip[1] + r_hip[1]) // 2)
+        mid_shoulder = ((l_shoulder[0] + r_shoulder[0]) // 2, (l_shoulder[1] + r_shoulder[1]) // 2)
+
+        # --- Angle: ear-hip-wrist (existing) ---
+        ear_hip_wrist = _calculate_angle(r_ear, r_hip, r_wrist)
+
+        # --- Hip rotation: angle of hip line relative to horizontal ---
+        # left_hip → mid_hip → horizontal reference point
+        h_ref = (mid_hip[0] + 100, mid_hip[1])
+        hip_rotation = _calculate_angle(l_hip, mid_hip, h_ref)
+
+        # --- Shoulder tilt: angle of shoulder line relative to vertical ---
+        # left_shoulder → mid_shoulder → vertical reference above mid_shoulder
+        v_ref_shoulder = (mid_shoulder[0], mid_shoulder[1] - 100)
+        shoulder_tilt = _calculate_angle(l_shoulder, mid_shoulder, v_ref_shoulder)
+
+        # --- Spine angle: angle of mid_hip→mid_shoulder relative to vertical ---
+        # mid_hip → mid_shoulder → vertical reference above mid_shoulder
+        spine_angle = _calculate_angle(mid_hip, mid_shoulder, v_ref_shoulder)
+
+        # Draw skeleton
         cv2.line(frame_bgr, r_hip, r_ear, COLORS["join"], 2, cv2.LINE_AA)
         cv2.line(frame_bgr, r_hip, r_wrist, COLORS["join"], 2, cv2.LINE_AA)
         cv2.line(frame_bgr, r_ear, r_wrist, COLORS["join"], 2, cv2.LINE_AA)
-        cv2.line(frame_bgr, BALL_POS, r_wrist, COLORS["light"], 2, cv2.LINE_AA)
+        if ball_pos:
+            cv2.line(frame_bgr, ball_pos, r_wrist, COLORS["light"], 2, cv2.LINE_AA)
+        cv2.line(frame_bgr, l_hip, r_hip, COLORS["axis"], 2, cv2.LINE_AA)          # hip line
+        cv2.line(frame_bgr, mid_hip, mid_shoulder, COLORS["axis"], 2, cv2.LINE_AA) # spine line
 
-        # Draw points
-        for point in [r_ear, r_wrist, r_hip, BALL_POS]:
+        # Draw key points
+        key_points = [r_ear, r_wrist, r_hip, l_hip, mid_hip, mid_shoulder]
+        if ball_pos:
+            key_points.append(ball_pos)
+        for point in key_points:
             cv2.circle(frame_bgr, point, 3, COLORS["marks"], -1)
 
-        # Calculate and display angle at hip (ear-hip-wrist)
-        angle = _calculate_angle(r_ear, r_hip, r_wrist)
-        cv2.putText(frame_bgr, f"Angle: {int(angle)} deg", (r_hip[0] + 20, r_hip[1] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLORS["text"], 2, cv2.LINE_AA)
+        # Annotate angles
+        cv2.putText(frame_bgr, f"Ear-Hip-Wrist: {int(ear_hip_wrist)}", (r_hip[0] + 20, r_hip[1] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLORS["text"], 2, cv2.LINE_AA)
+        cv2.putText(frame_bgr, f"Hip Rot: {int(hip_rotation)}", (mid_hip[0] + 20, mid_hip[1] + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLORS["text2"], 2, cv2.LINE_AA)
+        cv2.putText(frame_bgr, f"Spine: {int(spine_angle)}", (mid_shoulder[0] + 20, mid_shoulder[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLORS["text2"], 2, cv2.LINE_AA)
+        cv2.putText(frame_bgr, f"Shoulder Tilt: {int(shoulder_tilt)}", (mid_shoulder[0] + 20, mid_shoulder[1] - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLORS["text2"], 2, cv2.LINE_AA)
 
-    return frame_bgr
+        metrics = {
+            "wrist_x": r_wrist[0],
+            "wrist_y": r_wrist[1],
+            "ear_hip_wrist_deg": round(ear_hip_wrist, 1),
+            "hip_rotation_deg": round(hip_rotation, 1),
+            "shoulder_tilt_deg": round(shoulder_tilt, 1),
+            "spine_angle_deg": round(spine_angle, 1),
+        }
 
+    return frame_bgr, metrics
+
+
+def detect_swing_phases(wrist_x_list, wrist_y_list, frame_numbers=None):
+    """
+    Detect swing phase boundaries from wrist trajectory.
+    Assumes right-handed golfer, down-the-line view.
+
+    Args:
+        wrist_x_list: wrist x pixel values per detected frame
+        wrist_y_list: wrist y pixel values per detected frame
+        frame_numbers: actual frame indices corresponding to each list entry.
+                       Defaults to [0, 1, 2, ...].
+
+    Returns:
+        Dict mapping phase names to actual frame numbers.
+    """
+    n = len(wrist_x_list)
+    if n < 10:
+        return {}
+
+    if frame_numbers is None:
+        frame_numbers = list(range(n))
+
+    x = np.array(wrist_x_list, dtype=float)
+    y = np.array(wrist_y_list, dtype=float)
+
+    # Smooth to reduce per-frame noise
+    window = max(3, n // 20)
+    kernel = np.ones(window) / window
+    x_smooth = np.convolve(x, kernel, mode='same')
+    y_smooth = np.convolve(y, kernel, mode='same')
+
+    dx = np.diff(x_smooth)
+
+    # Impact: wrist at maximum y (lowest point in image coords)
+    impact_idx = int(np.argmax(y_smooth))
+
+    # Top of backswing: last x-direction reversal before impact
+    # np.diff(np.sign(dx))[i] != 0  → sign changed between dx[i] and dx[i+1]
+    # which corresponds to the reversal happening around list index i+1
+    sign_changes = np.where(np.diff(np.sign(dx)))[0] + 1
+    top_candidates = sign_changes[sign_changes < impact_idx]
+    top_idx = int(top_candidates[-1]) if len(top_candidates) > 0 else impact_idx // 2
+
+    # Address: low-velocity region at the start before backswing begins
+    speed = np.abs(dx)
+    pre_top_speed = speed[:top_idx] if top_idx > 0 else speed
+    speed_threshold = np.percentile(pre_top_speed, 40) * 2
+    address_end_idx = 0
+    for i in range(top_idx):
+        if speed[i] > speed_threshold:
+            address_end_idx = max(0, i - 1)
+            break
+
+    def fn(idx):
+        """Map list index to actual frame number."""
+        idx = max(0, min(idx, n - 1))
+        return frame_numbers[idx]
+
+    phases = {
+        "address":        {"start_frame": fn(0),                  "end_frame": fn(address_end_idx)},
+        "backswing":      {"start_frame": fn(address_end_idx + 1), "end_frame": fn(top_idx - 1)},
+        "top":            {"frame": fn(top_idx)},
+        "downswing":      {"start_frame": fn(top_idx + 1),         "end_frame": fn(max(top_idx + 1, impact_idx - 1))},
+        "impact":         {"frame": fn(impact_idx)},
+        "follow_through": {"start_frame": fn(impact_idx + 1),      "end_frame": fn(n - 1)},
+    }
+
+    return phases
+
+
+def export_swing_data(output_path, video_path, fps, phases, frame_data):
+    """Export all per-frame metrics and phase summaries to JSON."""
+    metrics_at_top = {}
+    metrics_at_impact = {}
+
+    # Build a lookup from frame number → frame_data entry for key-frame extraction
+    frame_lookup = {fd["frame"]: fd for fd in frame_data}
+
+    if phases:
+        top_frame = phases.get("top", {}).get("frame")
+        impact_frame = phases.get("impact", {}).get("frame")
+
+        if top_frame is not None and top_frame in frame_lookup:
+            fd = frame_lookup[top_frame]
+            metrics_at_top = {
+                "hip_rotation_deg": fd.get("hip_rotation_deg"),
+                "shoulder_tilt_deg": fd.get("shoulder_tilt_deg"),
+                "spine_angle_deg": fd.get("spine_angle_deg"),
+            }
+
+        if impact_frame is not None and impact_frame in frame_lookup:
+            fd = frame_lookup[impact_frame]
+            wrist_speed = None
+            prev_frame = frame_lookup.get(impact_frame - 1)
+            if prev_frame:
+                dx = fd.get("wrist_x", 0) - prev_frame.get("wrist_x", 0)
+                dy = fd.get("wrist_y", 0) - prev_frame.get("wrist_y", 0)
+                wrist_speed = round(math.sqrt(dx**2 + dy**2), 2)
+            metrics_at_impact = {
+                "hip_rotation_deg": fd.get("hip_rotation_deg"),
+                "wrist_speed_px_per_frame": wrist_speed,
+            }
+
+    swing_data = {
+        "video": video_path,
+        "fps": fps,
+        "total_frames": len(frame_data),
+        "phases": phases,
+        "metrics_at_top": metrics_at_top,
+        "metrics_at_impact": metrics_at_impact,
+        "frame_data": frame_data,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(swing_data, f, indent=2)
+
+    print(f"Swing data exported to: {output_path}")
+
+
+def _get_point(landmark, frame_w, frame_h):
+    return (int(landmark.x * frame_w), int(landmark.y * frame_h))
+
+# Keep old name for compatibility
 def _get_point_from_landmark(landmark, frame_w, frame_h):
-    x = int(landmark.x * frame_w)
-    y = int(landmark.y * frame_h)
-    return (x, y)
+    return _get_point(landmark, frame_w, frame_h)
 
 def _calculate_angle(a, b, c):
     """Calculate angle ABC (in degrees) given three points."""
     a, b, c = np.array(a), np.array(b), np.array(c)
     ba = a - b
     bc = c - b
-    cos_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-    angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-    return angle
+    denom = np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8
+    cos_angle = np.dot(ba, bc) / denom
+    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
 
 def _draw_axes(frame, origin=(100, 100), length=50):
     """Draw X (horizontal) and Y (vertical) axis lines."""
     x_axis_end = (origin[0] + length, origin[1])
     y_axis_end = (origin[0], origin[1] - length)
-    cv2.line(frame, origin, x_axis_end, COLORS["axis"], 2)  # X-axis
-    cv2.line(frame, origin, y_axis_end, COLORS["axis"], 2)  # Y-axis
+    cv2.line(frame, origin, x_axis_end, COLORS["axis"], 2)
+    cv2.line(frame, origin, y_axis_end, COLORS["axis"], 2)
     cv2.putText(frame, "X", (x_axis_end[0] + 10, x_axis_end[1]),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS["axis"], 2)
     cv2.putText(frame, "Y", (y_axis_end[0] - 15, y_axis_end[1] - 5),

@@ -8,16 +8,21 @@
 ![Made with Love](https://img.shields.io/badge/Made%20with-%E2%9D%A4-lightpink)
 [![By HeleenaRobert](https://img.shields.io/badge/By-HeleenaRobert-purple?logo=github)](https://github.com/HeleenaRobert)
 
-A Python project that analyzes golf swings using **MediaPipe Pose**. It tracks body landmarks (ear, hip, wrist) and the golf ball, calculates swing angles, overlays X/Y axes for reference, and saves an annotated swing video.
+A Python project that analyzes golf swings using **MediaPipe Pose**. It tracks body landmarks, calculates swing angles, detects swing phases, and exports per-frame metrics — producing an annotated video and a structured JSON file ready for coaching or visualization.
 
 ---
 
 ## ✨ Features
 
-- Processes golf swing videos frame-by-frame.
-- Detects **ear, hip, wrist** positions using MediaPipe Pose.
-- Draws swing lines and wrist-to-ball connection.
-- Calculates and overlays **swing angle (ear-hip-wrist)** per frame.
+- Processes all video files in `input/` automatically (MP4, MOV, AVI, MKV, M4V, WMV).
+- Detects body landmarks using MediaPipe Pose and computes four angles per frame:
+  - **Ear–Hip–Wrist** — overall arm/body connection
+  - **Hip Rotation** — hip line angle relative to horizontal
+  - **Shoulder Tilt** — shoulder line angle relative to vertical
+  - **Spine Angle** — torso lean from vertical
+- Auto-detects the golf ball position using shape-based circle detection (color-agnostic).
+- Segments the swing into phases: address, backswing, top, downswing, impact, follow-through.
+- Exports per-frame metrics and phase summaries to a JSON file in `output/`.
 - Adds an **X/Y axis overlay** for spatial reference.
 - Saves annotated video automatically in `output/`.
 
@@ -25,25 +30,26 @@ A Python project that analyzes golf swings using **MediaPipe Pose**. It tracks b
 
 ## 📂 Folder Structure
 
-```Structure
+```text
 golf-swing-analysis/
 │
-├── golf_swing_analysis.py
+├── golf_swing_analysis.py       # Entry point
 │
 ├── utils/
-│   ├── swing_utils.py
-│   └── video_utils.py
+│   ├── swing_utils.py           # Pose detection, angle math, phase detection, export
+│   └── video_utils.py           # Video I/O helpers
 │
-├── input/
-│   └── Reference_Swing_DTL.mp4
+├── input/                       # Drop swing videos here (auto-created on first run)
 │
-├── output/
-│   └── Reference_Swing_DTL_out_landmarks.mp4
+├── output/                      # Annotated videos + JSON files (auto-created)
+│
+├── models/                      # MediaPipe model (auto-downloaded on first run)
 │
 ├── assets/
 │   ├── banner.png
 │   └── video_sample_image.png
 │
+├── HOW_IT_WORKS.md
 ├── requirements.txt
 ├── LICENSE
 ├── .gitignore
@@ -54,10 +60,14 @@ golf-swing-analysis/
 
 ## 🚀 How It Works
 
-1. Reads an input swing video from `input/`.
+1. Scans `input/` for any supported video files.
 2. Processes each frame with **MediaPipe Pose**.
 3. Draws landmarks, swing lines, angle text, and axes.
-4. Writes the annotated frames into an output video.
+4. Detects swing phases from the wrist trajectory.
+5. Writes the annotated frames to `output/` as MP4.
+6. Exports per-frame metrics and phase data to `output/` as JSON.
+
+For a detailed breakdown of the pipeline, see [HOW_IT_WORKS.md](HOW_IT_WORKS.md).
 
 ---
 
@@ -88,21 +98,27 @@ pip install -r requirements.txt
 
 ## ▶️ Usage
 
-1. Place your swing video in the `input/` folder.
-2. Run the script:
+1. Run the script once to auto-create the `input/` and `output/` folders:
 
    ```bash
    python golf_swing_analysis.py
    ```
 
-3. Processed video will be saved in `output/`.
+2. Drop one or more swing videos into the `input/` folder (any supported format).
+3. Run the script again — all videos in `input/` will be processed automatically.
+4. Results are saved in `output/`:
+   - `<video_name>_out_landmarks.mp4` — annotated video
+   - `<video_name>_swing_data.json` — per-frame metrics and phase data
+
+Supported formats: MP4, MOV, AVI, MKV, M4V, WMV
 
 ---
 
 ## 📌 Notes
 
-- Ball position is fixed (adjust `BALL_POS` in `swing_utils.py` for different videos).
-- Angle calculation is currently **ear–hip–wrist**; more angles can be added.
+- The `input/` and `output/` folders are created automatically on first run.
+- The golf ball is detected automatically using shape-based circle detection — no hardcoded position needed. If detection fails, the ball annotation is skipped gracefully.
+- The MediaPipe model (`models/pose_landmarker_full.task`) is downloaded automatically on first run.
 - Works best with **down-the-line swing videos**.
 
 ---
